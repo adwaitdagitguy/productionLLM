@@ -26,7 +26,7 @@ log = logging.getLogger("support_rag")
 # ------------------------- configuration -------------------------
 CSV_PATH = os.getenv("CSV_PATH", "csd.csv")
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")   # cheapest Groq text model
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")   # llama-3.1-8b-instant was shut down 16 Aug 2026
 GROQ_TIMEOUT_S = float(os.getenv("GROQ_TIMEOUT_S", "20"))
 
 CHUNK_SIZE, CHUNK_OVERLAP, TOP_K = 450, 60, 3
@@ -67,19 +67,30 @@ def load_faq(path: str) -> pd.DataFrame:
 
 # ------------------------- LLM backend (the only Groq-specific part) -------------------------
 def llm_generate(system: str, user: str, max_tokens: int = 160) -> str:
+    # gpt-oss is a reasoning model: hidden reasoning tokens count against the completion budget.
+    # Use low effort, hide the reasoning, and leave headroom so the visible answer is never starved.
     try:
         resp = _client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens + 512,
+            reasoning_effort="low",
+            include_reasoning=False,
         )
     except GroqError as e:
         # log only the exception type + HTTP status: never the key, prompt, or provider message
         status = getattr(e, "status_code", None)
         log.error("Groq call failed: %s status=%s", type(e).__name__, status)
         raise LLMBackendError(f"{type(e).__name__} (status={status})") from e
-    return (resp.choices[0].message.content or "").strip()
+
+    choice = resp.choices[0]
+    text = (choice.message.content or "").strip()
+    if not text:
+        # an empty reply is a backend problem, not "the FAQ has no answer"
+        log.error("Groq returned empty content finish_reason=%s", choice.finish_reason)
+        raise LLMBackendError(f"EmptyResponse (finish_reason={choice.finish_reason})")
+    return text
 
 
 # ------------------------- graph state + nodes -------------------------
